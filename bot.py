@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+"""
+Prezentatsiya Sotish Boti
+- Payme, Click, Karta o'tkazma orqali to'lov
+- Admin panel (prezentatsiya qo'shish, o'chirish, tasdiqlash)
+- Kategoriyalar bo'yicha sotish
+- Fayllar botda saqlanadi
+"""
+
+import logging
+import json
+import os
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
+    ConversationHandler
+)
+
+# ==================== SOZLAMALAR ====================
+BOT_TOKEN = "8734373114:AAF92DvxIMaMySqqeUdW5qhGgIzvmaAatO0"
+ADMIN_ID = 7256724675
+
+# To'lov rekvizitlari (o'zingiznikini kiriting)
+PAYME_LINK = "https://payme.uz/checkout/YOUR_MERCHANT_ID"  # O'zgartiring
+CLICK_LINK = "https://my.click.uz/services/pay?service_id=YOUR_SERVICE_ID"  # O'zgartiring
+CARD_NUMBER = "8600 0000 0000 0000"  # Karta raqamingizni kiriting
+CARD_OWNER = "Ism Familiya"  # Karta egasini kiriting
+
+# ==================== MA'LUMOTLAR BAZASI ====================
+DB_FILE = "database.json"
+
+def load_db():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {
+        "categories": {},
+        "presentations": {},
+        "orders": {},
+        "users": {}
+    }
+
+def save_db(db):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+# ==================== HOLAT KONSTANTALARI ====================
+(
+    MAIN_MENU, CATEGORY_LIST, PRESENTATION_LIST, PRESENTATION_DETAIL,
+    PAYMENT_METHOD, PAYMENT_CONFIRM, PAYMENT_SCREENSHOT,
+    ADMIN_MENU, ADMIN_ADD_CAT, ADMIN_ADD_PRES_NAME, ADMIN_ADD_PRES_DESC,
+    ADMIN_ADD_PRES_PRICE, ADMIN_ADD_PRES_CAT, ADMIN_ADD_PRES_FILE,
+    ADMIN_ORDERS, WAITING_SCREENSHOT
+) = range(16)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ==================== YORDAMCHI FUNKSIYALAR ====================
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+def get_main_keyboard(user_id):
+    keyboard = [
+        [KeyboardButton("🗂 Kategoriyalar"), KeyboardButton("🛒 Mening buyurtmalarim")],
+        [KeyboardButton("📞 Aloqa"), KeyboardButton("ℹ️ Haqida")]
+    ]
+    if is_admin(user_id):
+        keyboard.append([KeyboardButton("⚙️ Admin panel")])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# ==================== START ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db = load_db()
+
+    # Foydalanuvchini saqlash
+    db["users"][str(user.id)] = {
+        "name": user.full_name,
+        "username": user.username or "",
+        "id": user.id
+    }
+    save_db(db)
+
+    await update.message.reply_text(
+        f"👋 Salom, *{user.first_name}*!\n\n"
+        "📊 *Prezentatsiya Do'koniga* xush kelibsiz!\n\n"
+        "Bu yerda siz professional prezentatsiyalarni sotib olishingiz mumkin.\n\n"
+        "👇 Quyidagi menyudan tanlang:",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(user.id)
+    )
+    return MAIN_MENU
+
+# ==================== KATEGORIYALAR ====================
+async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    categories = db.get("categories", {})
+
+    if not categories:
+        await update.message.reply_text(
+            "😔 Hozircha kategoriyalar yo'q.\nTez orada qo'shiladi!",
+            reply_markup=get_main_keyboard(update.effective_user.id)
+        )
+        return MAIN_MENU
+
+    keyboard = []
+    for cat_id, cat_data in categories.items():
+        count = sum(1 for p in db["presentations"].values() if p.get("category_id") == cat_id)
+        keyboard.append([InlineKeyboardButton(
+            f"{cat_data['emoji']} {cat_data['name']} ({count} ta)",
+            callback_data=f"cat_{cat_id}"
+        )])
+
+    await update.message.reply_text(
+        "🗂 *Kategoriyalar*\n\nQaysi kategoriyani ko'rmoqchisiz?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CATEGORY_LIST
+
+# ==================== PREZENTATSIYALAR RO'YXATI ====================
+async def show_presentations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    cat_id = query.data.replace("cat_", "")
+    db = load_db()
+
+    presentations = {
+        pid: p for pid, p in db["presentations"].items()
+        if p.get("category_id") == cat_id
+    }
+    cat_name = db["categories"].get(cat_id, {}).get("name", "Kategoriya")
+
+    if not presentations:
+        await query.edit_message_text(
+            f"😔 *{cat_name}* kategoriyasida hozircha prezentatsiyalar yo'q."
+        )
+        return CATEGORY_LIST
+
+    keyboard = []
+    for pid, pres in presentations.items():
+        keyboard.append([InlineKeyboardButton(
+            f"📊 {pres['name']} — {pres['price']:,} so'm",
+            callback_data=f"pres_{pid}"
+        )])
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_categories")])
+
+    await query.edit_message_text(
+        f"📁 *{cat_name}* kategoriyasi\n\nQuyidagi prezentatsiyalardan birini tanlang:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return PRESENTATION_LIST
+
+# ==================== PREZENTATSIYA TAFSILOTI ====================
+async def show_presentation_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    pres_id = query.data.replace("pres_", "")
+    db = load_db()
+    pres = db["presentations"].get(pres_id)
+
+    if not pres:
+        await query.edit_message_text("❌ Prezentatsiya topilmadi!")
+        return MAIN_MENU
+
+    context.user_data["selected_pres_id"] = pres_id
+
+    keyboard = [
+        [InlineKeyboardButton("💳 Sotib olish", callback_data=f"buy_{pres_id}")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data=f"cat_{pres['category_id']}")]
+    ]
+
+    text = (
+        f"📊 *{pres['name']}*\n\n"
+        f"📝 {pres['description']}\n\n"
+        f"💰 Narxi: *{pres['price']:,} so'm*\n"
+        f"📁 Format: PowerPoint (.pptx)\n\n"
+        "Sotib olish uchun tugmani bosing 👇"
+    )
+
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return PRESENTATION_DETAIL
+
+# ==================== TO'LOV USULI TANLASH ====================
+async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    pres_id = query.data.replace("buy_", "")
+    context.user_data["selected_pres_id"] = pres_id
+
+    keyboard = [
+        [InlineKeyboardButton("💚 Payme orqali", callback_data="pay_payme")],
+        [InlineKeyboardButton("🔵 Click orqali", callback_data="pay_click")],
+        [InlineKeyboardButton("💳 Karta o'tkazma", callback_data="pay_card")],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_payment")]
+    ]
+
+    db = load_db()
+    pres = db["presentations"].get(pres_id, {})
+
+    await query.edit_message_text(
+        f"💰 *To'lov usulini tanlang*\n\n"
+        f"Prezentatsiya: *{pres.get('name', '')}*\n"
+        f"Narxi: *{pres.get('price', 0):,} so'm*\n\n"
+        "Qaysi usulda to'laysiz?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return PAYMENT_METHOD
+
+# ==================== TO'LOV MA'LUMOTLARI ====================
+async def payment_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    method = query.data.replace("pay_", "")
+    pres_id = context.user_data.get("selected_pres_id")
+    db = load_db()
+    pres = db["presentations"].get(pres_id, {})
+    price = pres.get("price", 0)
+
+    context.user_data["payment_method"] = method
+
+    if method == "payme":
+        text = (
+            f"💚 *Payme orqali to'lov*\n\n"
+            f"Summa: *{price:,} so'm*\n\n"
+            f"👇 Quyidagi link orqali to'lang:\n"
+            f"{PAYME_LINK}\n\n"
+            "✅ To'lovni amalga oshirgach, *screenshot* yuboring!"
+        )
+    elif method == "click":
+        text = (
+            f"🔵 *Click orqali to'lov*\n\n"
+            f"Summa: *{price:,} so'm*\n\n"
+            f"👇 Quyidagi link orqali to'lang:\n"
+            f"{CLICK_LINK}\n\n"
+            "✅ To'lovni amalga oshirgach, *screenshot* yuboring!"
+        )
+    else:  # card
+        text = (
+            f"💳 *Karta orqali to'lov*\n\n"
+            f"Summa: *{price:,} so'm*\n\n"
+            f"💳 Karta raqami: `{CARD_NUMBER}`\n"
+            f"👤 Karta egasi: *{CARD_OWNER}*\n\n"
+            "✅ To'lovni amalga oshirgach, *screenshot* yuboring!\n"
+            "⏳ Admin tasdiqlashidan so'ng prezentatsiya yuboriladi."
+        )
+
+    keyboard = [[InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_payment")]]
+
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    context.user_data["waiting_screenshot"] = True
+    return PAYMENT_SCREENSHOT
+
+# ==================== SCREENSHOT QABUL QILISH ====================
+async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("waiting_screenshot"):
+        return MAIN_MENU
+
+    pres_id = context.user_data.get("selected_pres_id")
+    method = context.user_data.get("payment_method", "")
+    db = load_db()
+    pres = db["presentations"].get(pres_id, {})
+    user = update.effective_user
+
+    # Buyurtma yaratish
+    import time
+    order_id = f"ord_{int(time.time())}_{user.id}"
+    db["orders"][order_id] = {
+        "user_id": user.id,
+        "user_name": user.full_name,
+        "username": user.username or "",
+        "pres_id": pres_id,
+        "pres_name": pres.get("name", ""),
+        "price": pres.get("price", 0),
+        "method": method,
+        "status": "pending" if method == "card" else "pending_auto",
+        "time": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    save_db(db)
+    context.user_data["current_order_id"] = order_id
+
+    # Adminga xabar yuborish
+    method_text = {"payme": "Payme", "click": "Click", "card": "Karta o'tkazma"}.get(method, method)
+
+    admin_text = (
+        f"🔔 *Yangi buyurtma!*\n\n"
+        f"👤 Xaridor: {user.full_name} (@{user.username or 'yo`q'})\n"
+        f"🆔 User ID: `{user.id}`\n"
+        f"📊 Prezentatsiya: *{pres.get('name', '')}*\n"
+        f"💰 Narxi: *{pres.get('price', 0):,} so'm*\n"
+        f"💳 To'lov: *{method_text}*\n"
+        f"📋 Buyurtma ID: `{order_id}`"
+    )
+
+    admin_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"approve_{order_id}"),
+            InlineKeyboardButton("❌ Rad etish", callback_data=f"reject_{order_id}")
+        ]
+    ])
+
+    try:
+        if update.message.photo:
+            await context.bot.send_photo(
+                ADMIN_ID,
+                photo=update.message.photo[-1].file_id,
+                caption=admin_text,
+                parse_mode="Markdown",
+                reply_markup=admin_keyboard
+            )
+        elif update.message.document:
+            await context.bot.send_document(
+                ADMIN_ID,
+                document=update.message.document.file_id,
+                caption=admin_text,
+                parse_mode="Markdown",
+                reply_markup=admin_keyboard
+            )
+        else:
+            await context.bot.send_message(
+                ADMIN_ID,
+                text=admin_text + "\n\n⚠️ Screenshot fayl sifatida yuborilmagan!",
+                parse_mode="Markdown",
+                reply_markup=admin_keyboard
+            )
+    except Exception as e:
+        logger.error(f"Admin xabar yuborishda xato: {e}")
+
+    context.user_data["waiting_screenshot"] = False
+
+    await update.message.reply_text(
+        "✅ *To'lovingiz qabul qilindi!*\n\n"
+        "⏳ Admin tekshirib, tez orada prezentatsiyani yuboradi.\n"
+        "Odatda 5-30 daqiqa ichida javob beriladi.\n\n"
+        "Savollar uchun: /start",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(user.id)
+    )
+    return MAIN_MENU
+
+# ==================== ADMIN: TASDIQLASH ====================
+async def admin_approve_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+
+    order_id = query.data.replace("approve_", "")
+    db = load_db()
+    order = db["orders"].get(order_id)
+
+    if not order:
+        await query.edit_message_caption("❌ Buyurtma topilmadi!")
+        return
+
+    pres = db["presentations"].get(order["pres_id"])
+    if not pres:
+        await query.edit_message_caption("❌ Prezentatsiya topilmadi!")
+        return
+
+    # Foydalanuvchiga fayl yuborish
+    try:
+        await context.bot.send_document(
+            order["user_id"],
+            document=pres["file_id"],
+            caption=(
+                f"🎉 *To'lovingiz tasdiqlandi!*\n\n"
+                f"📊 *{pres['name']}* sizga yuborildi!\n\n"
+                "Xarid uchun rahmat! 🙏\n"
+                "Yana xarid qilish uchun: /start"
+            ),
+            parse_mode="Markdown"
+        )
+
+        db["orders"][order_id]["status"] = "completed"
+        save_db(db)
+
+        await query.edit_message_caption(
+            query.message.caption + "\n\n✅ *TASDIQLANDI va yuborildi!*",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await query.edit_message_caption(
+            query.message.caption + f"\n\n❌ Yuborishda xato: {e}",
+            parse_mode="Markdown"
+        )
+
+# ==================== ADMIN: RAD ETISH ====================
+async def admin_reject_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+
+    order_id = query.data.replace("reject_", "")
+    db = load_db()
+    order = db["orders"].get(order_id)
+
+    if not order:
+        await query.edit_message_caption("❌ Buyurtma topilmadi!")
+        return
+
+    try:
+        await context.bot.send_message(
+            order["user_id"],
+            "❌ *To'lovingiz tasdiqlanmadi.*\n\n"
+            "Sabab: To'lov aniqlanmadi yoki noto'g'ri miqdor.\n\n"
+            "Qayta urinish uchun: /start\n"
+            "Muammo bo'lsa admin bilan bog'laning.",
+            parse_mode="Markdown"
+        )
+
+        db["orders"][order_id]["status"] = "rejected"
+        save_db(db)
+
+        await query.edit_message_caption(
+            query.message.caption + "\n\n❌ *RAD ETILDI*",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Rad etishda xato: {e}")
+
+# ==================== ADMIN PANEL ====================
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Ruxsat yo'q!")
+        return MAIN_MENU
+
+    keyboard = [
+        [InlineKeyboardButton("📁 Kategoriya qo'shish", callback_data="admin_add_cat")],
+        [InlineKeyboardButton("📊 Prezentatsiya qo'shish", callback_data="admin_add_pres")],
+        [InlineKeyboardButton("📋 Kategoriyalar ro'yxati", callback_data="admin_list_cats")],
+        [InlineKeyboardButton("📊 Prezentatsiyalar ro'yxati", callback_data="admin_list_pres")],
+        [InlineKeyboardButton("🛒 Buyurtmalar", callback_data="admin_orders")],
+        [InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="admin_users")]
+    ]
+
+    await update.message.reply_text(
+        "⚙️ *Admin Panel*\n\nNimani qilmoqchisiz?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ADMIN_MENU
+
+# ==================== ADMIN: KATEGORIYA QO'SHISH ====================
+async def admin_add_category_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📁 *Yangi kategoriya*\n\n"
+        "Kategoriya nomini va emoji yuboring.\n"
+        "Masalan: `📱 Texnologiya` yoki `💼 Biznes`\n\n"
+        "Bekor qilish: /cancel",
+        parse_mode="Markdown"
+    )
+    return ADMIN_ADD_CAT
+
+async def admin_save_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    parts = text.split(" ", 1)
+
+    if len(parts) < 2:
+        await update.message.reply_text("❌ Format noto'g'ri!\nMasalan: `📱 Texnologiya`", parse_mode="Markdown")
+        return ADMIN_ADD_CAT
+
+    emoji = parts[0]
+    name = parts[1]
+
+    import time
+    cat_id = f"cat_{int(time.time())}"
+    db = load_db()
+    db["categories"][cat_id] = {"name": name, "emoji": emoji, "id": cat_id}
+    save_db(db)
+
+    await update.message.reply_text(
+        f"✅ Kategoriya qo'shildi: *{emoji} {name}*",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(update.effective_user.id)
+    )
+    return MAIN_MENU
+
+# ==================== ADMIN: PREZENTATSIYA QO'SHISH ====================
+async def admin_add_pres_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    db = load_db()
+    if not db.get("categories"):
+        await query.edit_message_text(
+            "❌ Avval kategoriya qo'shing!\n\n"
+            "Admin panel → Kategoriya qo'shish"
+        )
+        return ADMIN_MENU
+
+    await query.edit_message_text(
+        "📊 *Yangi prezentatsiya qo'shish*\n\n"
+        "1️⃣ Prezentatsiya *nomini* yuboring:\n\n"
+        "Bekor qilish: /cancel",
+        parse_mode="Markdown"
+    )
+    context.user_data["new_pres"] = {}
+    return ADMIN_ADD_PRES_NAME
+
+async def admin_pres_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_pres"]["name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "2️⃣ Prezentatsiya *tavsifini* yuboring:\n(qisqacha ma'lumot)",
+        parse_mode="Markdown"
+    )
+    return ADMIN_ADD_PRES_DESC
+
+async def admin_pres_get_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_pres"]["description"] = update.message.text.strip()
+    await update.message.reply_text(
+        "3️⃣ Prezentatsiya *narxini* yuboring:\n(faqat raqam, masalan: 50000)",
+        parse_mode="Markdown"
+    )
+    return ADMIN_ADD_PRES_PRICE
+
+async def admin_pres_get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = int(update.message.text.strip().replace(" ", "").replace(",", ""))
+        context.user_data["new_pres"]["price"] = price
+    except ValueError:
+        await update.message.reply_text("❌ Faqat raqam kiriting! Masalan: 50000")
+        return ADMIN_ADD_PRES_PRICE
+
+    db = load_db()
+    keyboard = []
+    for cat_id, cat in db["categories"].items():
+        keyboard.append([InlineKeyboardButton(
+            f"{cat['emoji']} {cat['name']}",
+            callback_data=f"select_cat_{cat_id}"
+        )])
+
+    await update.message.reply_text(
+        "4️⃣ *Kategoriyani* tanlang:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ADMIN_ADD_PRES_CAT
+
+async def admin_pres_get_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    cat_id = query.data.replace("select_cat_", "")
+    context.user_data["new_pres"]["category_id"] = cat_id
+
+    await query.edit_message_text(
+        "5️⃣ Endi *prezentatsiya faylini* (.pptx) yuboring:",
+        parse_mode="Markdown"
+    )
+    return ADMIN_ADD_PRES_FILE
+
+async def admin_pres_get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.document:
+        await update.message.reply_text("❌ Fayl yuboring! (.pptx formatida)")
+        return ADMIN_ADD_PRES_FILE
+
+    file_id = update.message.document.file_id
+    new_pres = context.user_data.get("new_pres", {})
+    new_pres["file_id"] = file_id
+
+    import time
+    pres_id = f"pres_{int(time.time())}"
+
+    db = load_db()
+    db["presentations"][pres_id] = new_pres
+    save_db(db)
+
+    cat = db["categories"].get(new_pres.get("category_id", ""), {})
+
+    await update.message.reply_text(
+        f"✅ *Prezentatsiya qo'shildi!*\n\n"
+        f"📊 Nom: *{new_pres['name']}*\n"
+        f"💰 Narx: *{new_pres['price']:,} so'm*\n"
+        f"📁 Kategoriya: *{cat.get('emoji', '')} {cat.get('name', '')}*",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(update.effective_user.id)
+    )
+    context.user_data.pop("new_pres", None)
+    return MAIN_MENU
+
+# ==================== ADMIN: RO'YXATLAR ====================
+async def admin_list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    db = load_db()
+    cats = db.get("categories", {})
+
+    if not cats:
+        await query.edit_message_text("📁 Kategoriyalar yo'q.")
+        return ADMIN_MENU
+
+    text = "📁 *Kategoriyalar ro'yxati:*\n\n"
+    keyboard = []
+    for cat_id, cat in cats.items():
+        count = sum(1 for p in db["presentations"].values() if p.get("category_id") == cat_id)
+        text += f"{cat['emoji']} *{cat['name']}* — {count} ta prezentatsiya\n"
+        keyboard.append([InlineKeyboardButton(
+            f"🗑 {cat['name']} ni o'chirish",
+            callback_data=f"del_cat_{cat_id}"
+        )])
+
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_admin")])
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_MENU
+
+async def admin_delete_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    cat_id = query.data.replace("del_cat_", "")
+    db = load_db()
+
+    cat_name = db["categories"].get(cat_id, {}).get("name", "")
+    del db["categories"][cat_id]
+    # Shu kategoriyaga tegishli prezentatsiyalarni ham o'chirish
+    to_delete = [pid for pid, p in db["presentations"].items() if p.get("category_id") == cat_id]
+    for pid in to_delete:
+        del db["presentations"][pid]
+    save_db(db)
+
+    await query.edit_message_text(f"✅ *{cat_name}* kategoriyasi o'chirildi!", parse_mode="Markdown")
+    return ADMIN_MENU
+
+async def admin_list_presentations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    db = load_db()
+    pres_list = db.get("presentations", {})
+
+    if not pres_list:
+        await query.edit_message_text("📊 Prezentatsiyalar yo'q.")
+        return ADMIN_MENU
+
+    keyboard = []
+    for pid, pres in pres_list.items():
+        keyboard.append([InlineKeyboardButton(
+            f"🗑 {pres['name']} ({pres['price']:,} so'm)",
+            callback_data=f"del_pres_{pid}"
+        )])
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_admin")])
+
+    await query.edit_message_text(
+        "📊 *Prezentatsiyalar:*\nO'chirish uchun bosing:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ADMIN_MENU
+
+async def admin_delete_presentation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    pres_id = query.data.replace("del_pres_", "")
+    db = load_db()
+
+    pres_name = db["presentations"].get(pres_id, {}).get("name", "")
+    if pres_id in db["presentations"]:
+        del db["presentations"][pres_id]
+        save_db(db)
+
+    await query.edit_message_text(f"✅ *{pres_name}* o'chirildi!", parse_mode="Markdown")
+    return ADMIN_MENU
+
+async def admin_show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    db = load_db()
+    orders = db.get("orders", {})
+
+    if not orders:
+        await query.edit_message_text("🛒 Buyurtmalar yo'q.")
+        return ADMIN_MENU
+
+    text = "🛒 *So'nggi buyurtmalar:*\n\n"
+    count = 0
+    for oid, order in reversed(list(orders.items())):
+        if count >= 10:
+            break
+        status_emoji = {"pending": "⏳", "completed": "✅", "rejected": "❌"}.get(order["status"], "❓")
+        text += (
+            f"{status_emoji} *{order['pres_name']}*\n"
+            f"👤 {order['user_name']} | 💰 {order['price']:,} so'm\n"
+            f"📅 {order.get('time', '')}\n\n"
+        )
+        count += 1
+
+    keyboard = [[InlineKeyboardButton("🔙 Orqaga", callback_data="back_admin")]]
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_MENU
+
+async def admin_show_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    db = load_db()
+    users = db.get("users", {})
+
+    text = f"👥 *Foydalanuvchilar: {len(users)} ta*\n\n"
+    for uid, user in list(users.items())[-20:]:
+        text += f"• {user['name']} (@{user.get('username', 'yo`q')})\n"
+
+    keyboard = [[InlineKeyboardButton("🔙 Orqaga", callback_data="back_admin")]]
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_MENU
+
+# ==================== MENING BUYURTMALARIM ====================
+async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db = load_db()
+
+    user_orders = {oid: o for oid, o in db["orders"].items() if o["user_id"] == user_id}
+
+    if not user_orders:
+        await update.message.reply_text(
+            "🛒 Siz hali hech narsa xarid qilmagansiz.\n\n"
+            "Prezentatsiyalarni ko'rish uchun: 🗂 Kategoriyalar",
+            reply_markup=get_main_keyboard(user_id)
+        )
+        return MAIN_MENU
+
+    text = "🛒 *Mening buyurtmalarim:*\n\n"
+    for oid, order in user_orders.items():
+        status_text = {"pending": "⏳ Kutilmoqda", "completed": "✅ Bajarildi", "rejected": "❌ Rad etildi"}.get(order["status"], "❓")
+        text += f"📊 *{order['pres_name']}*\n💰 {order['price']:,} so'm | {status_text}\n\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard(user_id))
+    return MAIN_MENU
+
+# ==================== ALOQA VA HAQIDA ====================
+async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📞 *Aloqa*\n\n"
+        "Savollar uchun admin bilan bog'laning:\n"
+        "👤 @admin_username\n\n"  # O'zgartiring
+        "⏰ Ish vaqti: 9:00 - 22:00",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(update.effective_user.id)
+    )
+    return MAIN_MENU
+
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ *Bot haqida*\n\n"
+        "📊 Bu bot orqali professional prezentatsiyalar sotib olishingiz mumkin.\n\n"
+        "💳 To'lov usullari: Payme, Click, Karta o'tkazma\n"
+        "📁 Format: PowerPoint (.pptx)\n"
+        "⚡️ Tezkor yetkazib berish",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(update.effective_user.id)
+    )
+    return MAIN_MENU
+
+# ==================== BEKOR QILISH ====================
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "❌ Bekor qilindi.",
+        reply_markup=get_main_keyboard(update.effective_user.id)
+    )
+    return MAIN_MENU
+
+async def cancel_payment_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_text("❌ To'lov bekor qilindi.")
+    return MAIN_MENU
+
+async def back_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = load_db()
+    categories = db.get("categories", {})
+
+    keyboard = []
+    for cat_id, cat_data in categories.items():
+        count = sum(1 for p in db["presentations"].values() if p.get("category_id") == cat_id)
+        keyboard.append([InlineKeyboardButton(
+            f"{cat_data['emoji']} {cat_data['name']} ({count} ta)",
+            callback_data=f"cat_{cat_id}"
+        )])
+
+    await query.edit_message_text(
+        "🗂 *Kategoriyalar*\n\nQaysi kategoriyani ko'rmoqchisiz?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CATEGORY_LIST
+
+async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("📁 Kategoriya qo'shish", callback_data="admin_add_cat")],
+        [InlineKeyboardButton("📊 Prezentatsiya qo'shish", callback_data="admin_add_pres")],
+        [InlineKeyboardButton("📋 Kategoriyalar ro'yxati", callback_data="admin_list_cats")],
+        [InlineKeyboardButton("📊 Prezentatsiyalar ro'yxati", callback_data="admin_list_pres")],
+        [InlineKeyboardButton("🛒 Buyurtmalar", callback_data="admin_orders")],
+        [InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="admin_users")]
+    ]
+
+    await query.edit_message_text(
+        "⚙️ *Admin Panel*\n\nNimani qilmoqchisiz?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ADMIN_MENU
+
+# ==================== ASOSIY FUNKSIYA ====================
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            MAIN_MENU: [
+                MessageHandler(filters.Regex("^🗂 Kategoriyalar$"), show_categories),
+                MessageHandler(filters.Regex("^🛒 Mening buyurtmalarim$"), my_orders),
+                MessageHandler(filters.Regex("^📞 Aloqa$"), contact),
+                MessageHandler(filters.Regex("^ℹ️ Haqida$"), about),
+                MessageHandler(filters.Regex("^⚙️ Admin panel$"), admin_panel),
+            ],
+            CATEGORY_LIST: [
+                CallbackQueryHandler(show_presentations, pattern="^cat_"),
+                CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+            ],
+            PRESENTATION_LIST: [
+                CallbackQueryHandler(show_presentation_detail, pattern="^pres_"),
+                CallbackQueryHandler(back_categories, pattern="^back_categories$"),
+                CallbackQueryHandler(show_presentations, pattern="^cat_"),
+            ],
+            PRESENTATION_DETAIL: [
+                CallbackQueryHandler(choose_payment, pattern="^buy_"),
+                CallbackQueryHandler(show_presentations, pattern="^cat_"),
+            ],
+            PAYMENT_METHOD: [
+                CallbackQueryHandler(payment_info, pattern="^pay_"),
+                CallbackQueryHandler(cancel_payment_cb, pattern="^cancel_payment$"),
+            ],
+            PAYMENT_SCREENSHOT: [
+                MessageHandler(filters.PHOTO | filters.Document.ALL, receive_screenshot),
+                CallbackQueryHandler(cancel_payment_cb, pattern="^cancel_payment$"),
+            ],
+            ADMIN_MENU: [
+                CallbackQueryHandler(admin_add_category_start, pattern="^admin_add_cat$"),
+                CallbackQueryHandler(admin_add_pres_start, pattern="^admin_add_pres$"),
+                CallbackQueryHandler(admin_list_categories, pattern="^admin_list_cats$"),
+                CallbackQueryHandler(admin_list_presentations, pattern="^admin_list_pres$"),
+                CallbackQueryHandler(admin_show_orders, pattern="^admin_orders$"),
+                CallbackQueryHandler(admin_show_users, pattern="^admin_users$"),
+                CallbackQueryHandler(admin_delete_category, pattern="^del_cat_"),
+                CallbackQueryHandler(admin_delete_presentation, pattern="^del_pres_"),
+                CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+            ],
+            ADMIN_ADD_CAT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_category),
+            ],
+            ADMIN_ADD_PRES_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pres_get_name),
+            ],
+            ADMIN_ADD_PRES_DESC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pres_get_desc),
+            ],
+            ADMIN_ADD_PRES_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pres_get_price),
+            ],
+            ADMIN_ADD_PRES_CAT: [
+                CallbackQueryHandler(admin_pres_get_cat, pattern="^select_cat_"),
+            ],
+            ADMIN_ADD_PRES_FILE: [
+                MessageHandler(filters.Document.ALL, admin_pres_get_file),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    # Admin callback handlerlari (ConversationHandler tashqarisida ham ishlashi uchun)
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(admin_approve_order, pattern="^approve_"))
+    app.add_handler(CallbackQueryHandler(admin_reject_order, pattern="^reject_"))
+
+    print("🤖 Bot ishga tushdi!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
