@@ -27,8 +27,8 @@ ADMIN_ID = 7256724675
 # To'lov rekvizitlari (o'zingiznikini kiriting)
 PAYME_LINK = "https://payme.uz/checkout/YOUR_MERCHANT_ID"  # O'zgartiring
 CLICK_LINK = "https://my.click.uz/services/pay?service_id=YOUR_SERVICE_ID"  # O'zgartiring
-CARD_NUMBER = "8600 0000 0000 0000"  # Karta raqamingizni kiriting
-CARD_OWNER = "Ism Familiya"  # Karta egasini kiriting
+CARD_NUMBER = "9860080163921093"  # Karta raqamingizni kiriting
+CARD_OWNER = "Abdulayeva Hilola"  # Karta egasini kiriting
 
 # ==================== MA'LUMOTLAR BAZASI ====================
 DB_FILE = "database.json"
@@ -70,7 +70,7 @@ def is_admin(user_id):
 def get_main_keyboard(user_id):
     keyboard = [
         [KeyboardButton("🗂 Kategoriyalar"), KeyboardButton("🛒 Mening buyurtmalarim")],
-        [KeyboardButton("📞 Aloqa"), KeyboardButton("ℹ️ Haqida")]
+        [KeyboardButton("📞 +998904713066"), KeyboardButton("ℹ️ Haqida")]
     ]
     if is_admin(user_id):
         keyboard.append([KeyboardButton("⚙️ Admin panel")])
@@ -764,8 +764,8 @@ async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📞 *Aloqa*\n\n"
         "Savollar uchun admin bilan bog'laning:\n"
-        "👤 @admin_username\n\n"  # O'zgartiring
-        "⏰ Ish vaqti: 9:00 - 22:00",
+        "👤 @admin_Hilola\n 📱+998904713066\n\n"  # O'zgartiring
+        "⏰ Ish vaqti: 24/7",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(update.effective_user.id)
     )
